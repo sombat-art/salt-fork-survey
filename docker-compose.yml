@@ -1,0 +1,45 @@
+name: salt-fork-survey
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: saltfork
+      POSTGRES_DB: salt_fork
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      TZ: Asia/Bangkok
+    volumes:
+      # PostgreSQL 18+ images keep their data under /var/lib/postgresql
+      # (older images used /var/lib/postgresql/data).
+      - pg_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saltfork -d salt_fork"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    # No "ports:" on purpose: the database is reachable only by the app,
+    # over Docker's private network, never from outside the server.
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: saltfork
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGDATABASE: salt_fork
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASS: ${ADMIN_PASS:?Set ADMIN_PASS in .env}
+      TZ: Asia/Bangkok
+    ports:
+      # Listen on the server's loopback address only; Caddy (or another
+      # reverse proxy) on the same server provides HTTPS to the outside.
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+
+volumes:
+  pg_data:

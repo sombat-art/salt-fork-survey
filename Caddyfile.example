@@ -1,0 +1,22 @@
+# Pick ONE of these blocks and add it to Caddy's config (usually /etc/caddy/Caddyfile).
+# All of them forward to the survey app on 127.0.0.1:8000.
+
+# Option 1: a real domain name whose DNS A record points to the public IP
+# (43.209.118.141), with ports 80 and 443 forwarded to this server.
+# Caddy gets a free Let's Encrypt certificate automatically.
+survey.example.ac.th {
+    reverse_proxy 127.0.0.1:8000
+}
+
+# Option 2: no domain yet. nip.io turns the IP into a hostname, so Let's Encrypt
+# still works (same port 80/443 requirement as option 1).
+# 43-209-118-141.nip.io {
+#     reverse_proxy 127.0.0.1:8000
+# }
+
+# Option 3: internal network only (participants on NECTEC Wi-Fi/VPN).
+# Caddy makes its own certificate; browsers will show a warning the first time.
+# 10.228.144.143 {
+#     tls internal
+#     reverse_proxy 127.0.0.1:8000
+# }

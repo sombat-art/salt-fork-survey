@@ -1,39 +1,62 @@
 """
-Minimal server for the post-use evaluation form.
+Post-use evaluation form for the Salt Fork field study, storing results in PostgreSQL.
 
-- GET  /        -> serves form.html as-is
-- POST /submit  -> validates the submission and appends one row to evaluations.csv
-- GET  /thanks  -> plain thank-you page
-- GET  /export  -> downloads evaluations.csv (HTTP Basic Auth)
+- GET  /         -> serves form.html as-is
+- POST /submit   -> validates the submission and inserts one row into `evaluations`
+- GET  /export   -> downloads all responses as CSV (HTTP Basic Auth)
+- GET  /healthz  -> checks that PostgreSQL is reachable
 
-No database. One folder, two files to run (form.html + app.py), one CSV file
-that grows as people submit. Good fit for ~500 submissions; not meant to
-scale past that without moving to a real database.
+Database connection settings come from the standard PostgreSQL environment
+variables (PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE). docker-compose.yml
+sets them for you.
 
-Run:
-    pip install flask
-    python3 app.py
-    # open http://localhost:8000
-
-Deploy: same idea as any small Flask app — gunicorn behind Caddy/nginx for
-HTTPS, or just `python3 app.py` behind a reverse proxy. See README.md.
+Run with Docker (app + PostgreSQL together):
+    cp .env.example .env      # then set the passwords
+    docker compose up -d --build
 """
 
+import atexit
 import csv
+import hmac
+import io
+import logging
 import os
-import threading
+import sys
+import time
 from datetime import datetime, timezone
 from functools import wraps
+from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, request, send_from_directory
+from flask import Flask, Response, redirect, request, send_from_directory, url_for
+from psycopg import Error as PgError
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.environ.get("CSV_PATH", os.path.join(BASE_DIR, "evaluations.csv"))
+FORM_VERSION = "2.0 (19 ก.พ. 2569)"
+LOCAL_TZ = ZoneInfo("Asia/Bangkok")
+
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "change-me")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+
+# Refuse to start with no admin password or the placeholder from .env.example:
+# /export returns every participant's answers.
+if not ADMIN_PASS or ADMIN_PASS == "change-me":
+    sys.exit("ADMIN_PASS is not set (or is still 'change-me'). Set it in .env and restart.")
 
 app = Flask(__name__)
-_csv_lock = threading.Lock()
+app.logger.setLevel(logging.INFO)  # show start-up and error messages in `docker compose logs`
+
+# One pool per worker process. conninfo="" means "use the PG* environment variables".
+# open=True starts connecting in the background; it does not block if the DB is still starting.
+# check= tests each connection before handing it out, so a connection broken by a
+# database restart is replaced instead of failing a participant's submission.
+pool = ConnectionPool(
+    conninfo="", min_size=1, max_size=5, open=True, timeout=10,
+    check=ConnectionPool.check_connection,
+)
+# Close the pool cleanly when the process exits (container stop, or a one-off
+# command such as `flask routes`); otherwise exit waits ~20 s for its threads.
+atexit.register(pool.close)
 
 USAGE_FREQUENCY = ["ไม่ใช้เลย", "นานๆครั้ง", "บ่อยแต่ไม่ทุกวัน", "ทุกวัน แต่ไม่ทุกมื้อ", "ทุกวัน และทุกมื้อ"]
 CALIBRATION_AWARENESS = ["ไม่ทราบเลย", "ทราบ แต่ไม่เคยทำ", "ทราบ และเคยทำแล้ว"]
@@ -47,18 +70,36 @@ SATISFACTION_KEYS = [
     "sat_switch_likelihood",
 ]
 
-FIELDNAMES = (
-    ["submitted_at", "usage_frequency"]
+# Columns written on insert (order matters: matches the VALUES placeholders).
+INSERT_COLUMNS = (
+    ["form_version", "usage_frequency"]
+    + SATISFACTION_KEYS
+    + ["calibration_awareness", "calibration_times", "price_agreement", "suggestions", "user_agent"]
+)
+INSERT_SQL = (
+    f"INSERT INTO evaluations ({', '.join(INSERT_COLUMNS)}) "
+    f"VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))})"
+)
+
+# Column order for the CSV export.
+EXPORT_FIELDS = (
+    ["id", "submitted_at", "usage_frequency"]
     + SATISFACTION_KEYS
     + ["calibration_awareness", "calibration_times", "price_agreement", "suggestions"]
 )
+EXPORT_SQL = f"SELECT {', '.join(EXPORT_FIELDS)} FROM evaluations ORDER BY submitted_at, id"
 
 
 def require_admin(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
         auth = request.authorization
-        if not auth or auth.username != ADMIN_USER or auth.password != ADMIN_PASS:
+        ok = (
+            auth is not None
+            and hmac.compare_digest((auth.username or "").encode(), ADMIN_USER.encode())
+            and hmac.compare_digest((auth.password or "").encode(), ADMIN_PASS.encode())
+        )
+        if not ok:
             return Response(
                 "Authentication required", 401,
                 {"WWW-Authenticate": 'Basic realm="Evaluation form admin"'},
@@ -67,18 +108,12 @@ def require_admin(view):
     return wrapped
 
 
-def ensure_csv_header():
-    if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) == 0:
-        with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
-            csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
-
-
-@app.route("/", methods=["GET"])
+@app.get("/")
 def index():
     return send_from_directory(BASE_DIR, "form.html")
 
 
-@app.route("/submit", methods=["POST"])
+@app.post("/submit")
 def submit():
     form = request.form
     errors = []
@@ -91,12 +126,24 @@ def submit():
     for key in SATISFACTION_KEYS:
         val = form.get(key, "")
         if val not in ("1", "2", "3", "4", "5"):
-            errors.append("missing/invalid {}".format(key))
-        satisfaction[key] = val
+            errors.append(f"missing/invalid {key}")
+        else:
+            satisfaction[key] = int(val)
 
     calibration = form.get("calibration", "")
     if calibration not in CALIBRATION_AWARENESS:
         errors.append("missing/invalid calibration")
+
+    calibration_times = None
+    if calibration == "ทราบ และเคยทำแล้ว":
+        raw = form.get("calibration_times", "").strip()
+        if raw:
+            try:
+                calibration_times = int(raw)
+                if not 0 <= calibration_times <= 100000:
+                    errors.append("invalid calibration_times")
+            except ValueError:
+                errors.append("invalid calibration_times")
 
     price_agreement = form.get("price_agreement", "")
     if price_agreement not in PRICE_AGREEMENT:
@@ -109,36 +156,101 @@ def submit():
             400,
         )
 
-    row = {
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "usage_frequency": usage_frequency,
-        "calibration_awareness": calibration,
-        "calibration_times": form.get("calibration_times", "").strip() if calibration == "ทราบ และเคยทำแล้ว" else "",
-        "price_agreement": price_agreement,
-        "suggestions": form.get("suggestions", "").strip(),
-    }
-    row.update(satisfaction)
+    values = (
+        [FORM_VERSION, usage_frequency]
+        + [satisfaction[k] for k in SATISFACTION_KEYS]
+        + [
+            calibration,
+            calibration_times,
+            price_agreement,
+            form.get("suggestions", "").strip()[:5000],
+            request.headers.get("User-Agent", "")[:300],
+        ]
+    )
 
-    with _csv_lock:
-        ensure_csv_header()
-        with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
-            csv.DictWriter(f, fieldnames=FIELDNAMES).writerow(row)
+    try:
+        # The `with` block commits on success and rolls back on any error.
+        with pool.connection() as conn:
+            conn.execute(INSERT_SQL, values)
+    except (PgError, PoolTimeout):
+        app.logger.exception("Failed to save evaluation")
+        return (
+            "ขออภัย ระบบไม่สามารถบันทึกข้อมูลได้ในขณะนี้ กรุณาลองส่งใหม่อีกครั้งภายหลัง",
+            503,
+        )
 
+    # Post/Redirect/Get: send the browser to /thanks instead of answering the POST
+    # with the page, so refreshing the thank-you page can't resubmit the form.
+    return redirect(url_for("thanks"), code=303)
+
+
+@app.get("/thanks")
+def thanks():
     return send_from_directory(BASE_DIR, "thanks.html")
 
 
-@app.route("/export", methods=["GET"])
+@app.get("/export")
 @require_admin
 def export():
-    ensure_csv_header()
-    return send_from_directory(BASE_DIR, os.path.basename(CSV_PATH), as_attachment=True)
+    """All rows as CSV, UTF-8 with BOM so Thai opens correctly in Excel. Times in Bangkok time."""
+    buf = io.StringIO()
+    buf.write("﻿")
+    writer = csv.writer(buf)
+    writer.writerow(EXPORT_FIELDS)
+
+    try:
+        with pool.connection() as conn:
+            for row in conn.execute(EXPORT_SQL):
+                row = list(row)
+                row[1] = row[1].astimezone(LOCAL_TZ).isoformat(timespec="seconds")
+                writer.writerow(["" if v is None else v for v in row])
+    except (PgError, PoolTimeout):
+        app.logger.exception("Export failed")
+        return "Database unavailable, try again later", 503
+
+    filename = f"evaluations-{datetime.now(LOCAL_TZ).strftime('%Y%m%d-%H%M')}.csv"
+    return Response(
+        buf.getvalue(),
+        content_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
-@app.route("/healthz", methods=["GET"])
+@app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    try:
+        with pool.connection(timeout=3) as conn:
+            n = conn.execute("SELECT count(*) FROM evaluations").fetchone()[0]
+        return {"status": "ok", "db": "ok", "responses": n}
+    except (PgError, PoolTimeout):
+        return {"status": "degraded", "db": "unreachable"}, 503
 
+
+def ensure_schema(attempts=30, delay=2):
+    """Create the table if it doesn't exist. Retries while PostgreSQL is still starting.
+
+    An advisory lock makes sure only one gunicorn worker runs the DDL at a time.
+    """
+    with open(os.path.join(BASE_DIR, "schema.sql"), encoding="utf-8") as f:
+        ddl = f.read()
+    for attempt in range(1, attempts + 1):
+        try:
+            with pool.connection() as conn:
+                conn.execute("SELECT pg_advisory_lock(424201)")
+                try:
+                    conn.execute(ddl)
+                    conn.commit()
+                finally:
+                    conn.execute("SELECT pg_advisory_unlock(424201)")
+            app.logger.info("Database schema ready")
+            return
+        except (PgError, PoolTimeout) as exc:
+            app.logger.warning("Database not ready (attempt %d/%d): %s", attempt, attempts, exc)
+            time.sleep(delay)
+    sys.exit("Could not reach PostgreSQL to create the schema; giving up.")
+
+
+ensure_schema()
 
 if __name__ == "__main__":
-    ensure_csv_header()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)

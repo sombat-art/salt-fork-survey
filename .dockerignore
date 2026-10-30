@@ -1,0 +1,9 @@
+.env
+*.dump
+backups/
+.git/
+__pycache__/
+README.md
+backup.sh
+Caddyfile.example
+docker-compose.yml
