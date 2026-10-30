@@ -18,5 +18,14 @@
     <p>ระบบได้บันทึกคำตอบของท่านเรียบร้อยแล้ว</p>
   </div>
 </main>
+<script>
+// Remember which form was just sent, so the form page clears itself if the
+// participant presses Back, and delete the auto-saved answers (see form.html).
+try {
+  var id = sessionStorage.getItem('sf_submission_id');
+  if (id) sessionStorage.setItem('sf_sent_id', id);
+  sessionStorage.removeItem('sf_draft');
+} catch (e) {}
+</script>
 </body>
 </html>

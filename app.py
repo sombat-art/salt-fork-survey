@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from functools import wraps
 from zoneinfo import ZoneInfo
@@ -74,11 +75,15 @@ SATISFACTION_KEYS = [
 INSERT_COLUMNS = (
     ["form_version", "usage_frequency"]
     + SATISFACTION_KEYS
-    + ["calibration_awareness", "calibration_times", "price_agreement", "suggestions", "user_agent"]
+    + ["calibration_awareness", "calibration_times", "price_agreement", "suggestions", "user_agent",
+       "submission_id"]
 )
+# ON CONFLICT: a second POST with the same submission_id (Back + send again, or a
+# double tap on the button) is ignored instead of creating a duplicate row.
 INSERT_SQL = (
     f"INSERT INTO evaluations ({', '.join(INSERT_COLUMNS)}) "
-    f"VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))})"
+    f"VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))}) "
+    f"ON CONFLICT (submission_id) DO NOTHING"
 )
 
 # Column order for the CSV export.
@@ -149,6 +154,13 @@ def submit():
     if price_agreement not in PRICE_AGREEMENT:
         errors.append("missing/invalid price_agreement")
 
+    # Random ID the form page creates once per filled-in form (see form.html).
+    # Missing or malformed (e.g. JavaScript off): store NULL, which never conflicts.
+    try:
+        submission_id = str(uuid.UUID(form.get("submission_id", "")))
+    except ValueError:
+        submission_id = None
+
     if errors:
         return (
             "กรุณากลับไปตอบคำถามให้ครบทุกข้อ แล้วส่งแบบฟอร์มใหม่อีกครั้ง "
@@ -165,13 +177,16 @@ def submit():
             price_agreement,
             form.get("suggestions", "").strip()[:5000],
             request.headers.get("User-Agent", "")[:300],
+            submission_id,
         ]
     )
 
     try:
         # The `with` block commits on success and rolls back on any error.
         with pool.connection() as conn:
-            conn.execute(INSERT_SQL, values)
+            cur = conn.execute(INSERT_SQL, values)
+            if cur.rowcount == 0:
+                app.logger.info("Repeated submission %s ignored (already saved)", submission_id)
     except (PgError, PoolTimeout):
         app.logger.exception("Failed to save evaluation")
         return (

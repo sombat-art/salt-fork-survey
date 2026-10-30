@@ -81,6 +81,14 @@
     border: 1px solid var(--error-line); border-radius: 10px; font-weight: 600;
   }
   .form-error.show { display: block; }
+  /* Shown after Back from the thank-you page, when the form has been cleared. */
+  .sent-note {
+    display: none; margin: 0 0 16px; padding: 12px 14px;
+    background: #e6f4ea; color: var(--accent-dark);
+    border: 1px solid var(--accent); border-radius: 10px; font-weight: 600;
+  }
+  .sent-note.show { display: block; }
+  .button:disabled { opacity: 0.6; cursor: default; }
 </style>
 </head>
 <body>
@@ -89,7 +97,10 @@
     <h1>แบบฟอร์มสำหรับประเมินความพึงพอใจหลังการใช้งาน</h1>
     <p class="lead">ส้อมวัดความเค็มในอาหาร (ฉบับที่ 2.0 วันที่ 19 กุมภาพันธ์ พ.ศ. 2569)</p>
 
+    <div id="sent-note" class="sent-note" role="status">ส่งแบบประเมินเรียบร้อยแล้ว ขอบคุณที่ร่วมประเมิน หากต้องการส่งแบบประเมินอีกชุด กรุณากรอกใหม่ด้านล่าง</div>
+
     <form method="post" action="/submit">
+      <input type="hidden" name="submission_id" id="submission_id">
       <fieldset>
         <legend>ท่านมีการใช้งานส้อมวัดความเค็มนี้ด้วยความถี่ของการใช้งานในระดับใด?</legend>
         <label class="radio"><input type="radio" name="usage_frequency" value="ไม่ใช้เลย" required> ไม่ใช้เลย</label>
@@ -327,7 +338,82 @@
   var form = document.querySelector('form');
   var banner = document.getElementById('form-error');
   var times = document.getElementById('calib_times');
+  var button = form.querySelector('button[type=submit]');
+  var idField = document.getElementById('submission_id');
+  var sentNote = document.getElementById('sent-note');
   form.noValidate = true;
+
+  // --- One random ID per filled-in form -------------------------------------
+  // The server saves each ID only once, so sending the same form twice
+  // (Back from the thank-you page, or a double tap) can't create a duplicate.
+  // thanks.html records which ID was sent; when the participant comes back to
+  // this page with that ID, the old answers are cleared and a new ID is made.
+  var KEY_ID = 'sf_submission_id', KEY_SENT = 'sf_sent_id', KEY_DRAFT = 'sf_draft';
+  function load(key) { try { return sessionStorage.getItem(key); } catch (e) { return null; } }
+  function save(key, value) { try { sessionStorage.setItem(key, value); } catch (e) {} }
+  function remove(key) { try { sessionStorage.removeItem(key); } catch (e) {} }
+
+  // --- Auto-save of answers while the form is being filled in ---------------
+  // Kept in sessionStorage: only in this browser tab on the participant's phone,
+  // gone when the tab is closed, and deleted as soon as the form is sent.
+  // A refresh (or an accidental pull-down on a phone) brings the answers back.
+  var suggestions = form.elements['suggestions'];
+  function saveDraft() {
+    var draft = { id: idField.value, radios: {}, times: times.value, suggestions: suggestions.value };
+    Array.prototype.forEach.call(form.querySelectorAll('input[type=radio]:checked'), function (input) {
+      draft.radios[input.name] = input.value;
+    });
+    save(KEY_DRAFT, JSON.stringify(draft));
+  }
+  function restoreDraft(id) {
+    var draft;
+    try { draft = JSON.parse(load(KEY_DRAFT) || 'null'); } catch (e) { draft = null; }
+    if (!draft || draft.id !== id) return;          // belongs to another (sent) form
+    Array.prototype.forEach.call(form.querySelectorAll('input[type=radio]'), function (input) {
+      if (draft.radios[input.name] === input.value) input.checked = true;
+    });
+    times.value = draft.times || '';
+    times.style.display = draft.radios.calibration === 'ทราบ และเคยทำแล้ว' ? 'block' : 'none';
+    suggestions.value = draft.suggestions || '';
+  }
+  form.addEventListener('change', saveDraft);
+  form.addEventListener('input', saveDraft);       // typing in the text boxes
+
+  function newId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    var b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;   // UUID version 4
+    var h = Array.prototype.map.call(b, function (x) { return (x + 256).toString(16).slice(1); }).join('');
+    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+  }
+  function prepare() {
+    var id = load(KEY_ID);
+    if (id && id === load(KEY_SENT)) {
+      // This form was already sent: clear it so it can't be sent again by accident.
+      form.reset();
+      times.style.display = 'none';
+      Array.prototype.forEach.call(form.querySelectorAll('.missing'), function (box) {
+        box.classList.remove('missing');
+      });
+      banner.classList.remove('show');
+      sentNote.classList.add('show');
+      window.scrollTo(0, 0);
+      remove(KEY_DRAFT);
+      id = null;
+    }
+    if (!id) {
+      id = newId(); save(KEY_ID, id);
+    } else {
+      restoreDraft(id);                             // e.g. after a refresh
+    }
+    idField.value = id;
+    button.disabled = false;
+    button.textContent = 'ส่งแบบประเมิน';
+  }
+  // pageshow runs on a normal load and also when the browser restores the page
+  // from its back/forward cache (where the old answers would otherwise remain).
+  window.addEventListener('pageshow', prepare);
 
   // The box to highlight: one rating row, or the whole question.
   function boxOf(el) {
@@ -360,11 +446,16 @@
         ' ข้อ กรุณาตอบข้อที่มีกรอบสีแดง แล้วกดส่งอีกครั้ง';
       banner.classList.add('show');
       missing[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
     }
+    // All answered: block a second tap while the page is sending.
+    button.disabled = true;
+    button.textContent = 'กำลังส่ง...';
   });
 
   // Clear the red frame as soon as a question is answered.
   form.addEventListener('change', function (event) {
+    sentNote.classList.remove('show');
     var box = boxOf(event.target);
     if (box) box.classList.remove('missing');
     var left = form.querySelectorAll('.missing').length;

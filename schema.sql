@@ -44,3 +44,10 @@ CREATE TABLE IF NOT EXISTS evaluations (
 );
 
 CREATE INDEX IF NOT EXISTS evaluations_submitted_at_idx ON evaluations (submitted_at);
+
+-- Added 30 Oct 2026: one random ID per filled-in form, so pressing Back and
+-- sending the same form again (or a double tap) can't create a duplicate row.
+-- ALTER ... IF NOT EXISTS also upgrades a table created before this column existed.
+-- Rows from before the change have NULL here; NULLs never conflict with each other.
+ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS submission_id UUID;
+CREATE UNIQUE INDEX IF NOT EXISTS evaluations_submission_id_key ON evaluations (submission_id);
