@@ -15,6 +15,7 @@
     --border: #dde5e0;
     --error-bg: #fdecea;
     --error-ink: #7a2018;
+    --error-line: #d93025;
   }
   * { box-sizing: border-box; }
   body {
@@ -60,6 +61,26 @@
   }
   .button:hover { background: var(--accent-dark); }
   .note { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+
+  /* Unanswered questions: red frame plus a short message under the question. */
+  .missing {
+    border: 2px solid var(--error-line) !important;
+    background: var(--error-bg) !important;
+    border-radius: 10px;
+  }
+  fieldset.missing { padding: 16px 12px; margin-bottom: 8px; }
+  .missing::after {
+    content: "กรุณาเลือกคำตอบข้อนี้";
+    display: block; margin-top: 6px;
+    color: var(--error-ink); font-size: 0.85rem; font-weight: 600;
+  }
+  /* Summary shown just above the submit button. */
+  .form-error {
+    display: none; margin-top: 16px; padding: 12px 14px;
+    background: var(--error-bg); color: var(--error-ink);
+    border: 1px solid var(--error-line); border-radius: 10px; font-weight: 600;
+  }
+  .form-error.show { display: block; }
 </style>
 </head>
 <body>
@@ -257,7 +278,6 @@
               <label class="scale-opt"><input type="radio" name="sat_switch_likelihood" value="5"><span>5</span></label>
             </div>
           </div>
-
         </div>
       </fieldset>
 
@@ -293,9 +313,69 @@
         <div class="note">ไม่บังคับกรอก</div>
       </fieldset>
 
+      <div id="form-error" class="form-error" role="alert"></div>
       <button type="submit" class="button">ส่งแบบประเมิน</button>
     </form>
   </div>
 </main>
+
+<script>
+// Check the answers ourselves instead of relying on the browser's built-in
+// pop-up, which many phones show only briefly or not at all for radio buttons.
+// Without JavaScript the browser's own `required` check still applies.
+(function () {
+  var form = document.querySelector('form');
+  var banner = document.getElementById('form-error');
+  var times = document.getElementById('calib_times');
+  form.noValidate = true;
+
+  // The box to highlight: one rating row, or the whole question.
+  function boxOf(el) {
+    return el.closest('.scale-row') || el.closest('fieldset');
+  }
+
+  // Each required question, once (the first radio of each group has `required`).
+  var questions = Array.prototype.map.call(
+    form.querySelectorAll('input[type=radio][required]'),
+    function (input) { return input.name; }
+  );
+
+  form.addEventListener('submit', function (event) {
+    var missing = [];
+    questions.forEach(function (name) {
+      var box = boxOf(form.querySelector('input[name="' + name + '"]'));
+      var answered = form.querySelector('input[name="' + name + '"]:checked');
+      box.classList.toggle('missing', !answered);
+      if (!answered) missing.push(box);
+    });
+    if (times.style.display !== 'none' && !times.checkValidity()) {
+      var box = boxOf(times);
+      box.classList.add('missing');
+      if (missing.indexOf(box) === -1) missing.push(box);
+    }
+
+    if (missing.length) {
+      event.preventDefault();
+      banner.textContent = 'ยังตอบไม่ครบ ' + missing.length +
+        ' ข้อ กรุณาตอบข้อที่มีกรอบสีแดง แล้วกดส่งอีกครั้ง';
+      banner.classList.add('show');
+      missing[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  });
+
+  // Clear the red frame as soon as a question is answered.
+  form.addEventListener('change', function (event) {
+    var box = boxOf(event.target);
+    if (box) box.classList.remove('missing');
+    var left = form.querySelectorAll('.missing').length;
+    if (!left) {
+      banner.classList.remove('show');
+    } else {
+      banner.textContent = 'ยังตอบไม่ครบ ' + left +
+        ' ข้อ กรุณาตอบข้อที่มีกรอบสีแดง แล้วกดส่งอีกครั้ง';
+    }
+  });
+})();
+</script>
 </body>
 </html>
